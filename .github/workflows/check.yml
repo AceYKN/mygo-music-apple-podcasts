@@ -28,3 +28,17 @@ jobs:
         working-directory: helper
       - run: npm run helper:build
       - run: npm run package
+  host-patch:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+      - run: git clone --depth 1 --branch v0.1.22 https://github.com/egoist/mygo-music.git host-check
+      - run: |
+          if ((git rev-parse HEAD) -ne '1af0d8efd77fdf630c27cfc635f12e9cb089ce10') { throw 'Unexpected MyGo baseline' }
+          git apply ../host-patch/native-playback-progress.patch
+        working-directory: host-check
+      - run: go test ./internal/...
+        working-directory: host-check

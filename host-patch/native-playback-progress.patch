@@ -1,0 +1,591 @@
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 5477c23..350ac12 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -8,6 +8,7 @@ import (
+ 	"runtime/debug"
+ 	"slices"
+ 	"sync/atomic"
++	"time"
+ 
+ 	"github.com/egoist/mygo"
+ 	"github.com/egoist/mygo/ui"
+@@ -415,6 +416,7 @@ func Run() error {
+ 	})
+ 	mygo.App.OnBeforeQuit(func(*mygo.QuitEvent) {
+ 		a.quitting = true
++		a.pl.FlushProgress(8 * time.Second)
+ 		a.settings.Volume = a.volume
+ 		a.settings.save()
+ 		a.saveSession()
+diff --git a/internal/music/music.go b/internal/music/music.go
+index 9cf71e2..61f544c 100644
+--- a/internal/music/music.go
++++ b/internal/music/music.go
+@@ -388,6 +388,30 @@ type Recorder interface {
+ 	Played(track Track)
+ }
+ 
++// PlaybackStart lets a source resume native playback from its latest state.
++type PlaybackStart struct {
++	Position int64  `json:"position"`
++	Context  string `json:"context,omitempty"`
++}
++
++// PlaybackProgress is an actual native-player snapshot, in milliseconds.
++// Context is the source's opaque account/session value from PlaybackStart.
++type PlaybackProgress struct {
++	ID         string `json:"id"`
++	Position   int64  `json:"position"`
++	Duration   int64  `json:"duration"`
++	Playing    bool   `json:"playing"`
++	Completed  bool   `json:"completed"`
++	Context    string `json:"context,omitempty"`
++	Reason     string `json:"reason"`
++	RecordedAt string `json:"recordedAt"`
++}
++
++type PlaybackResumer interface {
++	PlaybackStart(id string) (*PlaybackStart, error)
++}
++type ProgressRecorder interface{ PlaybackProgress(PlaybackProgress) error }
++
+ // Source is where music comes from. Everything but Info and Can may take a
+ // while and is called off the main thread. A source that doesn't do something
+ // answers ErrUnsupported, and Can says so beforehand for the views to leave it
+diff --git a/internal/player/applepodcasts_live_test.go b/internal/player/applepodcasts_live_test.go
+new file mode 100644
+index 0000000..6932518
+--- /dev/null
++++ b/internal/player/applepodcasts_live_test.go
+@@ -0,0 +1,127 @@
++//go:build applepodcasts_live
++
++package player
++
++import (
++	"encoding/json"
++	"mygo-music/internal/music"
++	"mygo-music/internal/plugin"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++// The real plugin resumes and updates Apple progress using MyGo's muted native player.
++func TestApplePodcastsNativeLive(t *testing.T) {
++	dir := os.Getenv("MYGO_APPLE_PLUGIN")
++	data := os.Getenv("MYGO_APPLE_DATA")
++	if dir == "" || data == "" {
++		t.Skip("set explicit plugin and private-data paths for this opt-in live test")
++	}
++	src, err := plugin.Load(dir, filepath.Dir(data))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer src.Close()
++	account, err := src.Account()
++	if err != nil || account == nil {
++		t.Fatal("existing login was not restored", err)
++	}
++	start, err := src.PlaybackStart("1000799666254")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if start.Position == 0 {
++		t.Skip("use an already-started free sample so the original completion state can be restored")
++	}
++	posts := make(chan func(), 128)
++	p := New(func(fn func()) { posts <- fn })
++	p.SetVolume(0)
++	p.Source = func(string) music.Source { return src }
++	p.Cache = NewCache(t.TempDir(), 32<<20)
++	defer func() {
++		p.FlushProgress(15 * time.Second)
++		p.Source = func(string) music.Source { return nil }
++		p.stop()
++		if err := src.PlaybackProgress(music.PlaybackProgress{ID: "1000799666254", Position: start.Position, Duration: 3731000, Context: start.Context, Reason: "quit", RecordedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
++			t.Errorf("cannot restore pre-test position: %v", err)
++		}
++	}()
++	track := music.Track{ID: "1000799666254", Source: src.Info().ID, Name: "Native playback test", ShowID: "979020229", Duration: 3731000}
++	p.PlayTrack([]music.Track{track}, 0)
++	until := time.After(90 * time.Second)
++	for p.Loading() {
++		select {
++		case fn := <-posts:
++			fn()
++		case <-until:
++			t.Fatal("native audio did not load")
++		}
++	}
++	if p.Err() != "" || p.out == nil || p.remote != nil {
++		t.Fatalf("native player failed: %s", p.Err())
++	}
++	if p.Position() < time.Duration(start.Position)*time.Millisecond-time.Second {
++		t.Fatalf("did not resume from cloud: %v", p.Position())
++	}
++	t.Logf("Native audio ready; cloud resume %.3f s, native position %.3f s; volume zero", float64(start.Position)/1000, p.Position().Seconds())
++	p.Seek(120 * time.Second)
++	deadline := time.After(5 * time.Second)
++	for p.seeking {
++		select {
++		case fn := <-posts:
++			fn()
++		case <-deadline:
++			t.Fatal("seek did not finish")
++		}
++	}
++	p.TogglePlay()
++	for p.out.Playing() {
++		select {
++		case fn := <-posts:
++			fn()
++		case <-time.After(5 * time.Second):
++			t.Fatal("pause did not finish")
++		}
++	}
++	p.Seek(30 * time.Second)
++	if p.Position() != 30*time.Second {
++		t.Fatalf("native backward seek at %v", p.Position())
++	}
++	if !p.FlushProgress(15 * time.Second) {
++		t.Fatal("native progress callback did not finish")
++	}
++	// Query Apple again through the plugin instead of trusting its local state.
++	confirmed, err := src.PlaybackStart(track.ID)
++	if err != nil || confirmed.Position < 29000 || confirmed.Position > 31000 {
++		t.Fatalf("cloud did not confirm 30 seconds: %+v %v", confirmed, err)
++	}
++	t.Logf("Cloud confirmed native backward seek: %d ms", confirmed.Position)
++	// Restore the position found before this opt-in test.
++	progress := music.PlaybackProgress{ID: track.ID, Position: start.Position, Duration: track.Duration, Context: start.Context, Reason: "quit", RecordedAt: time.Now().UTC().Format(time.RFC3339Nano)}
++	if err = src.PlaybackProgress(progress); err != nil {
++		t.Fatal("cannot restore pre-test position", err)
++	}
++	// Prevent deferred stop from publishing the temporary test position again.
++	p.Source = func(string) music.Source { return nil }
++	entries, err := os.ReadDir(filepath.Join(data, "sync"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, entry := range entries {
++		if entry.Name() != account.ID+".json" {
++			continue
++		}
++		raw, err := os.ReadFile(filepath.Join(data, "sync", entry.Name()))
++		if err != nil {
++			t.Fatal(err)
++		}
++		var state struct {
++			Pending []json.RawMessage `json:"pending"`
++		}
++		if json.Unmarshal(raw, &state) != nil || len(state.Pending) != 0 {
++			t.Fatal("unconfirmed synchronization remains after live test")
++		}
++	}
++}
+diff --git a/internal/player/player.go b/internal/player/player.go
+index bdfd086..79b5962 100644
+--- a/internal/player/player.go
++++ b/internal/player/player.go
+@@ -64,7 +64,7 @@ type Player struct {
+ 	track   *music.Track
+ 	out     *audio.Player
+ 	stream  stream
+-	watch   *watched // stream, as out plays it
++	watch   *watched      // stream, as out plays it
+ 	info    *music.Stream // what the current track streams
+ 	fade    fader
+ 	gain    float64 // the current track's normalizing gain
+@@ -98,7 +98,12 @@ type Player struct {
+ 
+ 	recorded string // the track last told its source it played
+ 
+-	ahead *ahead // the next track's audio, asked for before its turn
++	ahead             *ahead // the next track's audio, asked for before its turn
++	progress          progressDelivery
++	progressContext   string
++	progressTicking   bool
++	progressCompleted bool
++	pendingExplicit   bool
+ }
+ 
+ func New(post func(func())) *Player {
+@@ -129,6 +134,7 @@ func New(post func(func())) *Player {
+ 
+ // sync shows the system, and Changed, where playback is.
+ func (p *Player) sync() {
++	p.publishProgress("state")
+ 	if p.Changed != nil {
+ 		defer p.Changed()
+ 	}
+@@ -162,7 +168,10 @@ func (p *Player) announce(t *music.Track, artwork []byte) {
+ }
+ 
+ func (p *Player) ended() {
++	p.progressCompleted = true
++	p.publishProgress("ended")
+ 	if p.repeat == RepeatOne {
++		p.progressCompleted = false
+ 		p.out.Seek(0)
+ 		p.out.Play()
+ 		return
+@@ -493,12 +502,14 @@ const seekGap = 30 * time.Millisecond
+ // which the audio player fades over a few milliseconds, rather than
+ // cutting from one sound to the other with a click.
+ func (p *Player) Seek(t time.Duration) {
++	p.progressCompleted = false
+ 	if p.remote != nil && p.remote.started {
+ 		p.remoteSeek(t)
+ 		return
+ 	}
+ 	if p.out == nil {
+ 		p.pending = t
++		p.pendingExplicit = true
+ 		return
+ 	}
+ 	out := p.out
+@@ -601,6 +612,7 @@ func (p *Player) Levels() ([Bands]float32, bool) {
+ }
+ 
+ func (p *Player) stop() {
++	p.publishProgress("stop")
+ 	if out := p.out; out != nil {
+ 		// Paused first, it fades out over a few milliseconds, rather than
+ 		// stopping with a click.
+@@ -676,6 +688,11 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
+ 	p.awaiting = false
+ 	p.lyrics, p.lyricsLoaded = nil, false
+ 	p.pending = from
++	p.pendingExplicit = false
++	p.progressContext = ""
++	p.progress.last = nil
++	p.progressCompleted = false
++	p.progressTicking = false
+ 	p.recorded = ""
+ 	p.announce(&t, nil)
+ 	p.refill()
+@@ -692,6 +709,23 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
+ 	}
+ 	pre := p.takeAhead(t, quality)
+ 	go func() {
++		var start *music.PlaybackStart
++		if resumer, ok := src.(music.PlaybackResumer); ok && src.Can("playbackStart") {
++			var err error
++			start, err = resumer.PlaybackStart(t.ID)
++			if err != nil {
++				if pre != nil {
++					pre.close()
++				}
++				p.post(func() {
++					if gen == p.gen {
++						p.loading = false
++						p.loadFailed(t.Source, err, at, skipped, stay)
++					}
++				})
++				return
++			}
++		}
+ 		info, s, err := p.open(src, t, quality, pre)
+ 		p.post(func() {
+ 			if gen != p.gen {
+@@ -706,6 +740,12 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
+ 				return
+ 			}
+ 			p.stream, p.info = s, info
++			if start != nil {
++				p.progressContext = start.Context
++				if !p.pendingExplicit {
++					p.pending = time.Duration(max(int64(0), start.Position)) * time.Millisecond
++				}
++			}
+ 			p.gain = normGain(info)
+ 			p.watch = &watched{stream: s, now: p.now, ended: func() { p.post(func() {}) }}
+ 			p.out = audio.NewPlayer(p.watch)
+diff --git a/internal/player/player_test.go b/internal/player/player_test.go
+index 95da0f7..aa77b65 100644
+--- a/internal/player/player_test.go
++++ b/internal/player/player_test.go
+@@ -239,7 +239,7 @@ func (s picky) Stream(id, _ string) (*music.Stream, error) {
+ 		return nil, music.ErrUnavailable
+ 	}
+ 	path, err := filepath.Abs("testdata/seek.mp3")
+-	return &music.Stream{URL: "file://" + filepath.ToSlash(path), Type: "mp3"}, err
++	return &music.Stream{URL: music.FileURL(path), Type: "mp3"}, err
+ }
+ 
+ // pickyQueue is a, b and c, of which b can't play.
+@@ -296,7 +296,7 @@ func TestPrevSkipsBack(t *testing.T) {
+ 	p.Prev()
+ 	settle(t, ch, p)
+ 	if p.Current().ID != "a" || !p.Playing() {
+-		t.Fatalf("previous went to %s, playing %v", p.Current().ID, p.Playing())
++		t.Fatalf("previous went to %s, playing %v, error %q", p.Current().ID, p.Playing(), p.Err())
+ 	}
+ 	p.Next()
+ 	settle(t, ch, p)
+diff --git a/internal/player/progress.go b/internal/player/progress.go
+new file mode 100644
+index 0000000..d16ad27
+--- /dev/null
++++ b/internal/player/progress.go
+@@ -0,0 +1,124 @@
++package player
++
++import (
++	"log"
++	"mygo-music/internal/music"
++	"sync"
++	"time"
++)
++
++type progressNotice struct {
++	source string
++	sink   music.ProgressRecorder
++	value  music.PlaybackProgress
++}
++type progressDelivery struct {
++	mu      sync.Mutex
++	pending []progressNotice
++	idle    chan struct{}
++	running bool
++	last    *music.PlaybackProgress
++}
++
++// publishProgress runs on the main thread. Delivery is ordered off that thread;
++// a slow source keeps the newest pending intent for each track and context.
++func (p *Player) publishProgress(reason string) {
++	if p.track == nil || p.out == nil || p.remote != nil || p.loading || p.seeking {
++		return
++	}
++	src := p.sourceOf(p.track)
++	if src == nil || !src.Can("playbackProgress") {
++		return
++	}
++	sink, ok := src.(music.ProgressRecorder)
++	if !ok {
++		return
++	}
++	position := max(int64(0), p.Position().Milliseconds())
++	duration := p.Duration().Milliseconds()
++	if p.progressCompleted {
++		position = max(position, duration)
++	}
++	value := music.PlaybackProgress{ID: p.track.ID, Position: position, Duration: duration, Playing: p.playing && reason != "stop" && reason != "quit" && !p.progressCompleted, Completed: p.progressCompleted, Context: p.progressContext, Reason: reason, RecordedAt: p.now().UTC().Format(time.RFC3339Nano)}
++	last := p.progress.last
++	if reason == "quit" || last == nil || last.ID != value.ID || last.Context != value.Context || last.Position != value.Position || last.Playing != value.Playing || last.Completed != value.Completed {
++		copy := value
++		p.progress.last = &copy
++		p.progress.enqueue(progressNotice{source: src.Info().ID, sink: sink, value: value})
++	}
++	if p.playing && !p.progressTicking {
++		p.progressTicking = true
++		gen := p.gen
++		p.after(15*time.Second, func() {
++			p.post(func() {
++				if gen != p.gen {
++					return
++				}
++				p.progressTicking = false
++				if p.playing {
++					p.publishProgress("tick")
++				}
++			})
++		})
++	}
++}
++func (d *progressDelivery) enqueue(notice progressNotice) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	replaced := false
++	for i, old := range d.pending {
++		if old.source == notice.source && old.value.ID == notice.value.ID && old.value.Context == notice.value.Context {
++			d.pending[i] = notice
++			replaced = true
++			break
++		}
++	}
++	if !replaced {
++		d.pending = append(d.pending, notice)
++	}
++	if d.running {
++		return
++	}
++	d.running = true
++	d.idle = make(chan struct{})
++	go func() {
++		for {
++			d.mu.Lock()
++			if len(d.pending) == 0 {
++				d.running = false
++				close(d.idle)
++				d.mu.Unlock()
++				return
++			}
++			next := d.pending[0]
++			d.pending = d.pending[1:]
++			d.mu.Unlock()
++			if err := next.sink.PlaybackProgress(next.value); err != nil {
++				log.Printf("plugin %s: playback progress: %v", next.source, err)
++			}
++		}
++	}()
++}
++
++// FlushProgress gives the current source a final position before it is closed.
++func (p *Player) FlushProgress(timeout time.Duration) bool {
++	if p.out != nil {
++		p.out.Pause()
++		p.playing = false
++	}
++	p.publishProgress("quit")
++	p.progress.mu.Lock()
++	idle, running := p.progress.idle, p.progress.running
++	p.progress.mu.Unlock()
++	if !running {
++		return true
++	}
++	timer := time.NewTimer(timeout)
++	defer timer.Stop()
++	select {
++	case <-idle:
++		return true
++	case <-timer.C:
++		return false
++	}
++}
+diff --git a/internal/player/progress_test.go b/internal/player/progress_test.go
+new file mode 100644
+index 0000000..00e3996
+--- /dev/null
++++ b/internal/player/progress_test.go
+@@ -0,0 +1,85 @@
++package player
++
++import (
++	"mygo-music/internal/music"
++	"testing"
++	"time"
++)
++
++type progressSource struct {
++	picky
++	start  func() (*music.PlaybackStart, error)
++	record func(music.PlaybackProgress) error
++}
++
++func (s *progressSource) Can(name string) bool {
++	return name == "playbackStart" && s.start != nil || name == "playbackProgress" && s.record != nil
++}
++func (s *progressSource) Info() music.Info {
++	return music.Info{ID: "s", Playback: music.PlaybackStream}
++}
++func (s *progressSource) PlaybackStart(string) (*music.PlaybackStart, error) { return s.start() }
++func (s *progressSource) PlaybackProgress(p music.PlaybackProgress) error    { return s.record(p) }
++
++// A restored native track resumes from fresh cloud progress instead of an old local session.
++func TestNativeCloudResumeAndManualBackwardSeek(t *testing.T) {
++	p, ch, q := pickyQueue()
++	defer p.stop()
++	src := &progressSource{picky: picky{ok: map[string]bool{"a": true}}, start: func() (*music.PlaybackStart, error) {
++		return &music.PlaybackStart{Position: 300, Context: "account"}, nil
++	}}
++	p.Source = func(string) music.Source { return src }
++	p.Restore(Session{Queue: q[:1], Order: []int{0}, At: 0, Position: 50})
++	settle(t, ch, p)
++	if p.Position() != 300*time.Millisecond || p.progressContext != "account" || p.Playing() {
++		t.Fatalf("resume at %v context %q playing %v", p.Position(), p.progressContext, p.Playing())
++	}
++	p.Seek(0)
++	if p.Position() != 0 {
++		t.Fatal("cloud resume overrode an explicit backward seek")
++	}
++}
++
++// A seek while the cloud callback is pending takes priority over its late resume position.
++func TestNativeManualSeekDuringCloudResume(t *testing.T) {
++	p, ch, q := pickyQueue()
++	defer p.stop()
++	started, release := make(chan struct{}), make(chan struct{})
++	src := &progressSource{picky: picky{ok: map[string]bool{"a": true}}, start: func() (*music.PlaybackStart, error) {
++		close(started)
++		<-release
++		return &music.PlaybackStart{Position: 300, Context: "account"}, nil
++	}}
++	p.Source = func(string) music.Source { return src }
++	p.Restore(Session{Queue: q[:1], Order: []int{0}, At: 0})
++	<-started
++	p.Seek(120 * time.Millisecond)
++	close(release)
++	settle(t, ch, p)
++	if p.Position() != 120*time.Millisecond {
++		t.Fatalf("explicit seek replaced with %v", p.Position())
++	}
++}
++
++// A slow synchronization callback cannot replace a later backward seek with an older position.
++func TestProgressDeliveryKeepsLatestBackwardIntent(t *testing.T) {
++	d := &progressDelivery{}
++	started, release := make(chan struct{}), make(chan struct{})
++	got := make(chan int64, 3)
++	src := &progressSource{record: func(p music.PlaybackProgress) error {
++		if p.Position == 100 {
++			close(started)
++			<-release
++		}
++		got <- p.Position
++		return nil
++	}}
++	d.enqueue(progressNotice{source: "s", sink: src, value: music.PlaybackProgress{ID: "1", Context: "account", Position: 100}})
++	<-started
++	d.enqueue(progressNotice{source: "s", sink: src, value: music.PlaybackProgress{ID: "1", Context: "account", Position: 120}})
++	d.enqueue(progressNotice{source: "s", sink: src, value: music.PlaybackProgress{ID: "1", Context: "account", Position: 30}})
++	close(release)
++	if first, second := <-got, <-got; first != 100 || second != 30 {
++		t.Fatalf("out of order progress %d %d", first, second)
++	}
++}
+diff --git a/internal/plugin/host.go b/internal/plugin/host.go
+index be7c8ab..2bc4f33 100644
+--- a/internal/plugin/host.go
++++ b/internal/plugin/host.go
+@@ -86,10 +86,11 @@ func (p *Plugin) installHost(v *vm) error {
+ 		return err
+ 	}
+ 	return rt.SetGlobal("host", map[string]any{
+-		"platform": runtime.GOOS,
+-		"arch":     runtime.GOARCH,
+-		"dir":      p.dir,
+-		"dataDir":  p.data,
++		"platform":     runtime.GOOS,
++		"arch":         runtime.GOARCH,
++		"dir":          p.dir,
++		"dataDir":      p.data,
++		"capabilities": map[string]any{"playbackProgress": 1},
+ 		"storage": map[string]any{
+ 			"get":    moejs.NativeFunc(p.storageGet(v)),
+ 			"set":    moejs.NativeFunc(p.storageSet(v)),
+diff --git a/internal/plugin/source.go b/internal/plugin/source.go
+index fd9cc2c..8bbd937 100644
+--- a/internal/plugin/source.go
++++ b/internal/plugin/source.go
+@@ -272,6 +272,17 @@ func (p *Plugin) Played(t music.Track) {
+ 	}
+ }
+ 
++func (p *Plugin) PlaybackStart(id string) (*music.PlaybackStart, error) {
++	var start music.PlaybackStart
++	if err := p.call("playbackStart", map[string]string{"id": id}, &start); err != nil {
++		return nil, err
++	}
++	return &start, nil
++}
++func (p *Plugin) PlaybackProgress(progress music.PlaybackProgress) error {
++	return p.call("playbackProgress", progress, nil)
++}
++
+ func (p *Plugin) Lyrics(id string) (*music.Lyrics, error) {
+ 	var l music.Lyrics
+ 	if err := p.call("lyrics", map[string]string{"id": id}, &l); err != nil {

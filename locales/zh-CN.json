@@ -59,5 +59,16 @@
   "This preview supports queues of up to 200 episodes. Select a smaller queue.": "本预览每次队列最多支持 200 集，请缩小播放队列。",
   "This item is not available for this account or region": "此内容在当前账号或地区不可用。",
   "Apple Podcasts is limiting requests. Please wait and retry.": "苹果播客暂时限制了请求，请稍后重试。",
-  "Apple Podcasts has not confirmed the episode completion state": "苹果播客尚未确认单集的完成状态。"
+  "Apple Podcasts has not confirmed the episode completion state": "苹果播客尚未确认单集的完成状态。",
+  "This MyGo build cannot report playback progress. Use the companion MyGo build for resume and progress sync.": "此 MyGo 版本尚未提供播放进度回调。请使用配套 MyGo 版本，以启用云端续播和进度同步。",
+  "Cannot reach the podcast audio host. Your Apple login was kept.": "无法连接播客音频服务器，已保留苹果登录状态。",
+  "No directly playable audio is available for this episode": "该单集暂无可交给 MyGo 直接播放的音频。",
+  "Sync Playback Position": "同步收听位置",
+  "Another device has newer listening progress. Choose whether to retry this position or keep the cloud position.": "另一台设备有更新的收听进度，请在“播放与同步”中选择重试本机位置或放弃待同步操作。",
+  "The official Apple Podcasts login page did not respond; the existing login was kept": "苹果官方登录页暂未响应，已有登录数据已保留。",
+  "Apple Podcasts has not confirmed the playback position. Check Playback and Sync.": "苹果播客尚未确认此播放位置，请检查“播放与同步”。",
+  "The playback belongs to a different account session. Start the episode again.": "此播放属于另一个账号会话，请重新打开单集。",
+  "This episode needs a protected or segmented playback format that has not been verified with native MyGo playback": "该单集使用受保护或分段音频，尚未通过 MyGo 原生播放验证。",
+  "This network redirects Apple Podcasts to another region. Some followed shows may be hidden. Check proxy rules and refresh; missing rows do not mean you unfollowed them.": "当前网络将苹果播客跳转到了其他地区，部分关注节目可能被隐藏。请检查代理规则后刷新；列表缺项不代表你取消了关注。",
+  "Apple Podcasts is routing this network to another region. Check your proxy rules before confirming account changes.": "当前网络将苹果播客跳转到了其他地区。请检查代理规则后再确认账号同步操作。"
 }

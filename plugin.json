@@ -1,20 +1,15 @@
 {
   "id": "apple-podcasts",
   "name": "Apple Podcasts",
-  "version": "0.1.0-preview.1",
+  "version": "0.2.0-preview.1",
   "minAppVersion": "0.1.22",
   "main": "index.js",
-  "playback": "remote",
+  "playback": "stream",
   "permissions": {
     "network": ["127.0.0.1"],
     "process": ["bin/apple-podcasts-helper.exe", "bin/apple-podcasts-helper"]
   },
   "settings": [
-    {
-      "key": "muteAudio",
-      "label": "Silent Verification",
-      "help": "This preview is silent by default. Enter off to enable sound; the helper restarts without signing you out."
-    },
     {
       "key": "chromePath",
       "label": "Chrome Executable",
@@ -22,11 +17,31 @@
     }
   ],
   "navigation": [
-    { "builtin": "home" },
-    { "title": "Continue Listening", "page": "continue", "icon": "play" },
-    { "title": "Latest Episodes", "page": "latest", "icon": "calendar" },
-    { "builtin": "shows", "title": "Following" },
-    { "builtin": "liked", "title": "Saved Episodes" },
-    { "title": "Playback and Sync", "page": "sync", "icon": "repeat" }
+    {
+      "builtin": "home"
+    },
+    {
+      "title": "Continue Listening",
+      "page": "continue",
+      "icon": "podcast"
+    },
+    {
+      "title": "Latest Episodes",
+      "page": "latest",
+      "icon": "calendar"
+    },
+    {
+      "builtin": "shows",
+      "title": "Following"
+    },
+    {
+      "builtin": "liked",
+      "title": "Saved Episodes"
+    },
+    {
+      "title": "Playback and Sync",
+      "page": "sync",
+      "icon": "chart"
+    }
   ]
 }

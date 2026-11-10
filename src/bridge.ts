@@ -44,7 +44,6 @@ async function connect(): Promise<Connection> {
         ? 'apple-podcasts-helper.exe'
         : 'apple-podcasts-helper';
     const args = ['--data-dir', host.dataDir];
-    if (host.setting('muteAudio') !== 'off') args.push('--mute');
     const chrome = host.setting('chromePath')?.trim();
     if (chrome) args.push('--chrome', chrome);
     let process: HostProcess;

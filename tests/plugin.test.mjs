@@ -52,7 +52,7 @@ const episode = (id, position = 120000) => ({
   },
 });
 
-test('Playback resumes from cloud and accepts an explicit backward position', async () => {
+test('Native playback returns audio and forwards actual progress without Chrome player commands', async () => {
   const plays = [];
   const p = await plugin(async (method, args) => ({
     ok: true,
@@ -61,19 +61,29 @@ test('Playback resumes from cloud and accepts an explicit backward position', as
         ? session
         : method === 'api.get'
           ? { data: [episode('1001')] }
-          : method === 'player.play'
-            ? (plays.push(args), true)
-            : true,
+          : method === 'media.stream'
+            ? { url: 'https://example.invalid/full.mp3', type: 'mp3' }
+            : method === 'progress.start'
+              ? { position: 120000, context: 'a' }
+              : method === 'progress.record'
+                ? (plays.push(args), { queued: true })
+                : true,
   }));
-  await p.remotePlay({ ids: ['1001'] });
-  await p.remotePlay({ ids: ['1001'], position: 30000 });
-  assert.deepEqual(
-    plays.map((x) => x.position),
-    [120000, 30000],
-  );
-  assert.equal(plays[0].items[0].attributes.durationInMillis, 3600000);
-  await p.browse({ page: 'beginning:1001' });
-  assert.equal(plays.at(-1).position, 0);
+  assert.equal((await p.stream({ id: '1001' })).type, 'mp3');
+  assert.equal((await p.playbackStart({ id: '1001' })).position, 120000);
+  const progress = {
+    id: '1001',
+    position: 30000,
+    duration: 3600000,
+    playing: false,
+    completed: false,
+    context: 'a',
+    reason: 'state',
+    recordedAt: '2026-11-10T00:00:00Z',
+  };
+  await p.playbackProgress(progress);
+  assert.deepEqual(plays, [progress]);
+  assert.equal(p.remotePlay, undefined);
 });
 
 test('Show pagination does not duplicate episodes at page boundaries', async () => {
@@ -112,7 +122,7 @@ test('Show pagination does not duplicate episodes at page boundaries', async () 
   );
 });
 
-test('Changing accounts invalidates cached episode permissions', async () => {
+test('Native streams resolve current permissions again after changing accounts', async () => {
   let account = 'a',
     played = false;
   const p = await plugin(async (method, args) => {
@@ -135,15 +145,127 @@ test('Changing accounts invalidates cached episode permissions', async () => {
         };
       return { ok: true, data: { data: [episode('1001')] } };
     }
-    if (method === 'player.play') played = true;
+    if (method === 'media.stream') {
+      if (account === 'b')
+        return {
+          ok: false,
+          error: { code: 'unavailable', message: 'No entitlement' },
+        };
+      played = true;
+      return {
+        ok: true,
+        data: { url: 'https://example.invalid/full.mp3', type: 'mp3' },
+      };
+    }
     return { ok: true, data: true };
   });
   await p.search({ query: 'Example', kind: 'tracks' });
   account = 'b';
   await p.account();
   await assert.rejects(
-    () => p.remotePlay({ ids: ['1001', '1002'] }),
+    () => p.stream({ id: '1002' }),
     (e) => e.code === 'unavailable',
   );
   assert.equal(played, false);
+});
+
+test('Concurrent stream requests share one resolution and logout rejects its late result', async () => {
+  let release, started;
+  const gate = new Promise((resolve) => {
+      release = resolve;
+    }),
+    entered = new Promise((resolve) => {
+      started = resolve;
+    });
+  let requests = 0;
+  const p = await plugin(async (method) => {
+    if (method === 'media.stream') {
+      requests++;
+      started();
+      await gate;
+      return {
+        ok: true,
+        data: { url: 'https://example.invalid/private.mp3', type: 'mp3' },
+      };
+    }
+    return { ok: true, data: true };
+  });
+  const a = p.stream({ id: '1001' }),
+    b = p.stream({ id: '1001' });
+  await entered;
+  const settled = Promise.allSettled([a, b]);
+  await p.signOut();
+  release();
+  const results = await settled;
+  assert.equal(requests, 1);
+  for (const result of results) {
+    assert.equal(result.status, 'rejected');
+    assert.equal(result.reason.code, 'conflict');
+  }
+});
+
+test('Concurrent account checks share one request and reuse the confirmed session', async () => {
+  let checks = 0;
+  const p = await plugin(async (method) => {
+    if (method === 'auth.status') checks++;
+    return { ok: true, data: session };
+  });
+  const accounts = await Promise.all([p.account(), p.account()]);
+  assert.equal(accounts[0].id, 'a');
+  await p.account();
+  assert.equal(checks, 1);
+});
+
+test('A region-filtered library is explained and My Page refresh clears a recovered route', async () => {
+  let filtered = true,
+    refreshes = 0;
+  const p = await plugin(async (method, args) => {
+    if (method === 'auth.status') {
+      if (args.refresh) refreshes++;
+      return { ok: true, data: session };
+    }
+    const following = args.path.includes('/library/podcasts?');
+    return {
+      ok: true,
+      data: {
+        data: following ? [{ id: '42', attributes: { name: 'Example' } }] : [],
+        ...(filtered && following
+          ? { sync: { stale: true, reason: 'region', routeCountry: 'cn' } }
+          : {}),
+      },
+    };
+  });
+  const first = await p.home();
+  assert.match(first.description, /another region/);
+  assert.equal(first.sections[1].shows[0].id, '42');
+  filtered = false;
+  const recovered = await p.browse({ page: 'account' });
+  assert.doesNotMatch(recovered.description ?? '', /another region/);
+  assert.equal(refreshes, 2);
+});
+
+test('An empty episode page with an advancing cursor does not hide later episodes', async () => {
+  const p = await plugin(async (method, args) => ({
+    ok: true,
+    data:
+      method === 'auth.status'
+        ? session
+        : args.path === '/v1/empty'
+          ? { data: [], next: '/v1/later' }
+          : args.path === '/v1/later'
+            ? { data: [episode('1001')] }
+            : {
+                data: [
+                  {
+                    id: '42',
+                    relationships: {
+                      episodes: { data: [], next: '/v1/empty' },
+                    },
+                  },
+                ],
+              },
+  }));
+  const result = await p.show({ id: '42' });
+  assert.equal(result.episodes[0].id, '1001');
+  assert.equal(result.more, false);
 });

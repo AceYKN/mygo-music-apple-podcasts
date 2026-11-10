@@ -75,6 +75,22 @@ func TestPaginationDeduplicatesAndRejectsLoops(t *testing.T) {
 		t.Fatal("accepted repeated cursor")
 	}
 }
+
+// Regional filtering can leave an empty page with a valid next cursor.
+func TestPaginationContinuesAfterEmptyPage(t *testing.T) {
+	calls := 0
+	c := fixture(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.URL.Query().Get("offset") == "1" {
+			return response(200, `{"data":[{"id":"42","type":"podcasts"}]}`), nil
+		}
+		return response(200, `{"data":[],"next":"/v1/me/library/podcasts?offset=1"}`), nil
+	})
+	r, err := c.All(context.Background(), "/v1/me/library/podcasts")
+	if err != nil || calls != 2 || len(r["data"].([]any)) != 1 {
+		t.Fatal("empty filtered page hid later followed shows", err)
+	}
+}
 func TestLibraryReadbackAfterUnknownWriteResult(t *testing.T) {
 	reads, writes := 0, 0
 	c := fixture(func(r *http.Request) (*http.Response, error) {

@@ -10,7 +10,12 @@ export interface Result {
   next?: string;
   results?: Record<string, { data?: Resource[]; next?: string }>;
   included?: Resource[];
-  sync?: { stale: boolean; at: string };
+  sync?: {
+    stale: boolean;
+    at?: string;
+    reason?: string;
+    routeCountry?: string;
+  };
 }
 export interface Track {
   id: string;
@@ -103,18 +108,6 @@ export function toTrack(r: Resource): Track {
     published: String(a.releaseDateTime ?? a.releaseDate ?? '').slice(0, 10),
     url: a.url,
     unavailable: a.isPlayable === false,
-  };
-}
-export function playerItem(r: Resource): Resource {
-  const a = r.attributes ?? {};
-  return {
-    ...r,
-    type: 'podcast-episodes',
-    attributes: {
-      ...a,
-      durationInMillis:
-        Number(a.durationInMilliseconds ?? a.durationInMillis) || 0,
-    },
   };
 }
 export function numericID(value: string): string {

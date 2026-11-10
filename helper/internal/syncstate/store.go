@@ -15,21 +15,25 @@ import (
 )
 
 type Operation struct {
-	ID      string `json:"id"`
-	Kind    string `json:"kind"`
-	Item    string `json:"item"`
-	On      bool   `json:"on"`
-	Created string `json:"created"`
-	Error   string `json:"error,omitempty"`
+	ID         string `json:"id"`
+	Kind       string `json:"kind"`
+	Item       string `json:"item"`
+	On         bool   `json:"on"`
+	Created    string `json:"created"`
+	Error      string `json:"error,omitempty"`
+	Position   int64  `json:"position,omitempty"`
+	Duration   int64  `json:"duration,omitempty"`
+	RecordedAt string `json:"recordedAt,omitempty"`
 }
 type Snapshot struct {
 	At   string         `json:"at"`
 	Data map[string]any `json:"data"`
 }
 type State struct {
-	Verified  bool                `json:"verified"`
-	Snapshots map[string]Snapshot `json:"snapshots"`
-	Pending   []Operation         `json:"pending"`
+	Verified  bool                 `json:"verified"`
+	Snapshots map[string]Snapshot  `json:"snapshots"`
+	Pending   []Operation          `json:"pending"`
+	Progress  map[string]Operation `json:"progress,omitempty"`
 }
 type Store struct {
 	mu  sync.Mutex
@@ -66,6 +70,9 @@ func (s *Store) load(account string) (State, error) {
 	}
 	if state.Pending == nil {
 		state.Pending = []Operation{}
+	}
+	if state.Progress == nil {
+		state.Progress = map[string]Operation{}
 	}
 	return state, nil
 }
@@ -171,6 +178,9 @@ func (s *Store) Resolve(account, id, message string) error {
 	for i, op := range state.Pending {
 		if op.ID == id {
 			if message == "" {
+				if op.Kind == "position" {
+					state.Progress[op.Item] = op
+				}
 				state.Pending = append(state.Pending[:i], state.Pending[i+1:]...)
 			} else {
 				state.Pending[i].Error = message
@@ -179,6 +189,50 @@ func (s *Store) Resolve(account, id, message string) error {
 		}
 	}
 	return nil
+}
+
+// QueuePosition rejects stale callbacks and holds conflicts until the listener
+// explicitly retries or discards them. Fresh intent replaces an offline tick.
+func (s *Store) QueuePosition(account, item string, position, duration int64, completed bool, recordedAt string, force bool) (Operation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.load(account)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	when, err := time.Parse(time.RFC3339Nano, recordedAt)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	if last, ok := state.Progress[item]; ok && !force {
+		if previous, e := time.Parse(time.RFC3339Nano, last.RecordedAt); e == nil && !when.After(previous) {
+			return last, false, nil
+		}
+	}
+	index := -1
+	for i, old := range state.Pending {
+		if old.Kind == "position" && old.Item == item {
+			if !force {
+				previous, e := time.Parse(time.RFC3339Nano, old.RecordedAt)
+				if old.Error == "conflict" || (e == nil && !when.After(previous)) {
+					return old, false, nil
+				}
+			}
+			index = i
+			break
+		}
+	}
+	bytes := make([]byte, 12)
+	if _, err = rand.Read(bytes); err != nil {
+		return Operation{}, false, err
+	}
+	op := Operation{ID: hex.EncodeToString(bytes), Kind: "position", Item: item, On: completed, Created: time.Now().UTC().Format(time.RFC3339), Position: position, Duration: duration, RecordedAt: recordedAt}
+	if index < 0 {
+		state.Pending = append(state.Pending, op)
+	} else {
+		state.Pending[index] = op
+	}
+	return op, true, s.save(account, state)
 }
 func (s *Store) Clear(account string) error {
 	s.mu.Lock()

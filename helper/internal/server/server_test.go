@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoopbackRPCAuthentication(t *testing.T) {
@@ -44,6 +45,63 @@ func TestLoopbackRPCAuthentication(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProgressIsDurableBeforeCloudWriteAndLatestBackwardIntentWins(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	reads := 0
+	position := int64(0)
+	at := time.Unix(1800000000, 0).UTC()
+	s := &Server{Store: syncstate.New(t.TempDir())}
+	s.Apple = testClient(func(r *http.Request) (*http.Response, error) {
+		if r.Method == "PUT" {
+			var body struct {
+				Attributes struct {
+					Position int64 `json:"positionInMilliseconds"`
+				} `json:"attributes"`
+			}
+			if json.NewDecoder(r.Body).Decode(&body) != nil {
+				t.Error("bad position body")
+			}
+			position = body.Attributes.Position
+			return response(204, ""), nil
+		}
+		reads++
+		if reads == 1 {
+			close(entered)
+			<-release
+		}
+		data, _ := json.Marshal(map[string]any{"data": []any{map[string]any{"id": "42", "relationships": map[string]any{"playback-position": map[string]any{"data": []any{map[string]any{"attributes": map[string]any{"positionInMilliseconds": position, "completed": false, "recordedAtTimestamp": at.Add(-time.Minute).Format(time.RFC3339Nano)}}}}}}}})
+		return response(200, string(data)), nil
+	})
+	account := "aaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := s.recordProgress(params{ID: "42", Context: account, Position: 120000, Duration: 600000, RecordedAt: at.Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	if _, err := s.recordProgress(params{ID: "42", Context: account, Position: 30000, Duration: 600000, RecordedAt: at.Add(time.Second).Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := s.Store.Read(account)
+	if len(state.Pending) != 1 || state.Pending[0].Position != 30000 {
+		t.Fatal("latest position was not persisted while network blocked")
+	}
+	close(release)
+	if !s.FlushProgress(5 * time.Second) {
+		t.Fatal("progress worker did not finish")
+	}
+	state, _ = s.Store.Read(account)
+	if len(state.Pending) != 0 || state.Progress["42"].Position != 30000 {
+		t.Fatal("older response replaced newer backward intent")
+	}
+}
+
+func TestProgressFromAnotherAccountCannotWrite(t *testing.T) {
+	writes := 0
+	s := &Server{Store: syncstate.New(t.TempDir()), Apple: testClient(func(*http.Request) (*http.Response, error) { writes++; return response(200, `{}`), nil })}
+	if _, err := s.recordProgress(params{ID: "42", Context: "other-account", Position: 30000, RecordedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err == nil || writes != 0 {
+		t.Fatal("accepted another account's playback event")
 	}
 }
 
@@ -135,5 +193,64 @@ func TestAccountChangeCannotCacheAnotherAccountsResponse(t *testing.T) {
 	state, _ := s.Store.Read("bbbbbbbbbbbbbbbbbbbbbbbb")
 	if len(state.Snapshots) != 0 {
 		t.Fatal("old account data cached for new account")
+	}
+}
+
+// A region-hidden show must not replace a healthy snapshot with an apparent unfollow.
+func TestRegionFilteringPreservesSnapshotAndRecoveryAcceptsRealUnfollow(t *testing.T) {
+	filtered, redirected := false, false
+	s := &Server{Store: syncstate.New(t.TempDir()), Region: apple.NewRegion()}
+	s.Apple = testClient(func(*http.Request) (*http.Response, error) {
+		if filtered {
+			return response(200, `{"data":[]}`), nil
+		}
+		return response(200, `{"data":[{"id":"42","attributes":{"name":"Example"}}]}`), nil
+	})
+	s.Region.HTTP.Transport = transportFunc(func(req *http.Request) (*http.Response, error) {
+		res := response(200, "")
+		res.Request = req.Clone(req.Context())
+		if redirected && strings.Contains(req.URL.Path, "/podcast/") {
+			res.Request.URL.Path = "/cn/new"
+		}
+		return res, nil
+	})
+	p := params{Path: "/v1/me/library/podcasts", All: true}
+	if _, err := s.get(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	filtered, redirected = true, true
+	result, err := s.get(context.Background(), p)
+	if err != nil || len(result["data"].([]any)) != 1 || result["sync"].(map[string]any)["reason"] != "region" {
+		t.Fatal("regional filtering erased the followed show", err)
+	}
+	state, _ := s.Store.Read("aaaaaaaaaaaaaaaaaaaaaaaa")
+	if len(state.Snapshots[apple.Origin+p.Path+"|all"].Data["data"].([]any)) != 1 {
+		t.Fatal("overwrote healthy snapshot")
+	}
+	redirected = false
+	result, err = s.get(context.Background(), p)
+	if err != nil || len(result["data"].([]any)) != 0 || result["sync"] != nil {
+		t.Fatal("healthy response could not confirm a real unfollow", err)
+	}
+}
+
+// Do not interpret region-hidden membership as proof an account change succeeded.
+func TestRegionMismatchKeepsWritePendingWithoutAccountRequest(t *testing.T) {
+	calls := 0
+	s := &Server{Store: syncstate.New(t.TempDir()), Region: apple.NewRegion()}
+	s.Apple = testClient(func(*http.Request) (*http.Response, error) {
+		calls++
+		return response(404, `{}`), nil
+	})
+	s.Region.HTTP.Transport = transportFunc(func(req *http.Request) (*http.Response, error) {
+		res := response(200, "")
+		res.Request = req.Clone(req.Context())
+		res.Request.URL.Path = "/cn/new"
+		return res, nil
+	})
+	_, err := s.write(context.Background(), "podcasts", "42", false)
+	state, _ := s.Store.Read("aaaaaaaaaaaaaaaaaaaaaaaa")
+	if err == nil || calls != 0 || len(state.Pending) != 1 || state.Pending[0].Error != "network" {
+		t.Fatal("region-hidden membership was treated as a confirmed unfollow")
 	}
 }

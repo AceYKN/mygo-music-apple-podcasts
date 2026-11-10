@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 const accountA = "aaaaaaaaaaaaaaaaaaaaaaaa"
@@ -48,6 +49,33 @@ func TestPendingChangesSurviveRestartAndRemainAccountScoped(t *testing.T) {
 	state, _ = restarted.Read(accountA)
 	if len(state.Pending) != 0 {
 		t.Fatal("confirmed operation retained")
+	}
+}
+
+func TestProgressJournalPreservesNewerBackwardSeekAndHoldsConflict(t *testing.T) {
+	s := New(t.TempDir())
+	at := time.Unix(1800000000, 0).UTC()
+	old, _, err := s.QueuePosition(accountA, "42", 120000, 600000, false, at.Format(time.RFC3339Nano), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, accepted, err := s.QueuePosition(accountA, "42", 30000, 600000, false, at.Add(time.Second).Format(time.RFC3339Nano), false)
+	if err != nil || !accepted {
+		t.Fatal(err)
+	}
+	s.Resolve(accountA, old.ID, "")
+	state, _ := s.Read(accountA)
+	if len(state.Pending) != 1 || state.Pending[0].Position != 30000 {
+		t.Fatal("older response lost backward intent")
+	}
+	s.Resolve(accountA, latest.ID, "conflict")
+	_, accepted, err = s.QueuePosition(accountA, "42", 32000, 600000, false, at.Add(2*time.Second).Format(time.RFC3339Nano), false)
+	if err != nil || accepted {
+		t.Fatal("periodic update silently replaced conflict")
+	}
+	_, accepted, err = s.QueuePosition(accountA, "42", 30000, 600000, false, at.Add(3*time.Second).Format(time.RFC3339Nano), true)
+	if err != nil || !accepted {
+		t.Fatal("explicit user retry was refused")
 	}
 }
 func TestSnapshotsRetainDisplayMetadataWithoutPlaybackSecrets(t *testing.T) {

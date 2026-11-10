@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/AceYKN/mygo-music-apple-podcasts/helper/internal/apple"
+	"github.com/AceYKN/mygo-music-apple-podcasts/helper/internal/auth"
 	"github.com/AceYKN/mygo-music-apple-podcasts/helper/internal/browser"
 	"github.com/AceYKN/mygo-music-apple-podcasts/helper/internal/lifetime"
 	"github.com/AceYKN/mygo-music-apple-podcasts/helper/internal/server"
@@ -50,9 +51,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Cannot open loopback listener")
 		os.Exit(1)
 	}
-	b := browser.New(filepath.Join(*data, "browser-profile"), *chrome, *mute)
-	defer b.Close()
-	rpc := &server.Server{Token: token, Browser: b, Apple: apple.New(b), Store: syncstate.New(filepath.Join(*data, "sync"))}
+	_ = mute // Compatibility with the previous verification launcher; login is always muted.
+	profile := filepath.Join(*data, "browser-profile")
+	_, legacyErr := os.Stat(filepath.Join(profile, "Default", "Network", "Cookies"))
+	public := auth.NewPublicDeveloper()
+	manager := &auth.Manager{Vault: auth.FileVault{Path: filepath.Join(*data, "session.bin")}, Migrate: legacyErr == nil, Developer: public.Get, Browser: func(interactive bool) auth.LoginBrowser { return browser.NewAuth(profile, *chrome, interactive) }}
+	defer manager.Close()
+	client := &apple.Client{Session: manager.Session, Clock: &apple.RemoteClock{}, OnResponse: manager.AcceptResponse, HTTP: &http.Client{Timeout: 25 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	rpc := &server.Server{Token: token, Auth: manager, Apple: client, Region: apple.NewRegion(), Store: syncstate.New(filepath.Join(*data, "sync"))}
 	httpServer := &http.Server{Handler: rpc, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 3 * time.Minute, IdleTimeout: 60 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -74,4 +80,5 @@ func main() {
 	shutdown, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdown)
+	rpc.FlushProgress(7 * time.Second)
 }

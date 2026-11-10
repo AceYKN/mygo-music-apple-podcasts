@@ -68,26 +68,4 @@ test('Paid entitlement is not inferred from public URL absence', () => {
     },
   };
   assert.equal(model.toTrack(r).unavailable, false);
-  assert.equal(model.playerItem(r).attributes.offers[0].type, 'PSUB');
-});
-test('Player item preserves cloud completion and explicit backward positions', () => {
-  const r = {
-    id: '1',
-    type: 'podcast-episodes',
-    attributes: { durationInMilliseconds: 30000 },
-    relationships: {
-      'playback-position': {
-        data: [
-          { attributes: { positionInMilliseconds: 1000, completed: false } },
-        ],
-      },
-    },
-  };
-  const item = model.playerItem(r);
-  assert.equal(item.attributes.durationInMillis, 30000);
-  assert.equal(
-    item.relationships['playback-position'].data[0].attributes
-      .positionInMilliseconds,
-    1000,
-  );
 });

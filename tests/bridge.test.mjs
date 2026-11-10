@@ -17,7 +17,7 @@ async function bridge() {
       ).toString('base64')
   );
 }
-test('Helper starts once, uses persistent private data and defaults to silent verification', async () => {
+test('Helper starts once and reuses persistent private data', async () => {
   let starts = 0,
     args,
     headers;
@@ -51,7 +51,7 @@ test('Helper starts once, uses persistent private data and defaults to silent ve
     const b = await bridge();
     await Promise.all([b.rpc('health'), b.rpc('health')]);
     assert.equal(starts, 1);
-    assert.deepEqual(args, ['--data-dir', 'test-private-data', '--mute']);
+    assert.deepEqual(args, ['--data-dir', 'test-private-data']);
     assert.equal(headers.authorization, 'Bearer ' + 'b'.repeat(64));
   } finally {
     globalThis.fetch = previous;

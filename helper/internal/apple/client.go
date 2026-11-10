@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/AceYKN/mygo-music-apple-podcasts/helper/internal/browser"
@@ -31,9 +32,39 @@ type Error struct {
 func (e *Error) Error() string { return e.Message }
 
 type Client struct {
-	Browser *browser.Browser
-	Session func() (browser.Session, error)
-	HTTP    *http.Client
+	Browser    *browser.Browser
+	Session    func() (browser.Session, error)
+	HTTP       *http.Client
+	OnResponse func(browser.Session, http.Header) error
+	Clock      *RemoteClock
+}
+
+// RemoteClock accounts for the API server's clock when comparing listening
+// timestamps. Transport round trips and second-resolution Date headers add a
+// small uncertainty; they must not turn our own acknowledged seek into conflict.
+type RemoteClock struct{ offset atomic.Int64 }
+
+func (c *RemoteClock) observe(header string, sent, received time.Time) {
+	date, err := http.ParseTime(header)
+	if err != nil {
+		return
+	}
+	delta := date.Sub(sent.Add(received.Sub(sent) / 2))
+	if delta > -5*time.Minute && delta < 5*time.Minute {
+		c.offset.Store(int64(delta))
+	}
+}
+func (c *RemoteClock) Correct(at time.Time) time.Time {
+	if c == nil {
+		return at
+	}
+	return at.Add(time.Duration(c.offset.Load()))
+}
+func (c *RemoteClock) OffsetMilliseconds() int64 {
+	if c == nil {
+		return 0
+	}
+	return time.Duration(c.offset.Load()).Milliseconds()
 }
 
 func New(b *browser.Browser) *Client {
@@ -102,11 +133,20 @@ func (c *Client) Request(ctx context.Context, method, path string, body any) (ma
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	sent := time.Now()
 	res, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, &Error{Code: "network", Message: "Cannot reach Apple Podcasts. Check your network and retry."}
 	}
 	defer res.Body.Close()
+	if c.Clock != nil {
+		c.Clock.observe(res.Header.Get("Date"), sent, time.Now())
+	}
+	if c.OnResponse != nil {
+		if err = c.OnResponse(s, res.Header); err != nil {
+			return nil, &Error{Code: "setup", Message: "Cannot securely save the renewed Apple Podcasts login; the previous login was kept"}
+		}
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		code := "network"
 		message := fmt.Sprintf("Apple Podcasts returned HTTP %d", res.StatusCode)
@@ -166,9 +206,6 @@ func (c *Client) All(ctx context.Context, path string) (map[string]any, error) {
 			}
 		}
 		path, _ = r["next"].(string)
-		if path != "" && len(data) == 0 {
-			return nil, &Error{Code: "network", Message: "Apple Podcasts returned an empty page with a next cursor"}
-		}
 		if page == 199 && path != "" {
 			return nil, &Error{Code: "network", Message: "Apple Podcasts library exceeds the pagination limit"}
 		}

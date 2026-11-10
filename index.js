@@ -33,7 +33,6 @@ async function connect() {
   pending = (async () => {
     const executable = host.platform === "windows" ? "apple-podcasts-helper.exe" : "apple-podcasts-helper";
     const args = ["--data-dir", host.dataDir];
-    if (host.setting("muteAudio") !== "off") args.push("--mute");
     const chrome = host.setting("chromePath")?.trim();
     if (chrome) args.push("--chrome", chrome);
     let process;
@@ -188,17 +187,6 @@ function toTrack(r) {
     unavailable: a.isPlayable === false
   };
 }
-function playerItem(r) {
-  const a = r.attributes ?? {};
-  return {
-    ...r,
-    type: "podcast-episodes",
-    attributes: {
-      ...a,
-      durationInMillis: Number(a.durationInMilliseconds ?? a.durationInMillis) || 0
-    }
-  };
-}
 function numericID(value) {
   if (!/^\d{1,24}$/.test(value))
     throw new Error("Invalid Apple Podcasts item ID");
@@ -220,21 +208,52 @@ function shareID(query) {
 
 // src/index.ts
 var current;
-var resources = /* @__PURE__ */ new Map();
+var sessionCheckedAt = 0;
+var sessionEpoch = 0;
+var streamEpoch = 0;
+var checkingSession;
+var pendingStreams = /* @__PURE__ */ new Map();
 var pages = /* @__PURE__ */ new Map();
 var staleAt;
-var remember = (items = []) => {
-  for (const item of items) resources.set(item.id, item);
-  return items;
-};
-async function session(required = false) {
-  const next = await rpc("auth.status");
+var regionFiltered = false;
+var nativeProgress;
+var resourceList = (items = []) => items;
+async function session(required = false, force = false) {
+  if (!force && current && Date.now() - sessionCheckedAt < 45e3) {
+    if (required && !current.authorized)
+      throw new PluginError(
+        "signIn",
+        host.t("Sign in to Apple Podcasts first")
+      );
+    return current;
+  }
+  const generation = sessionEpoch;
+  const pending2 = checkingSession ??= rpc("auth.status", {
+    refresh: force
+  });
+  let next;
+  try {
+    next = await pending2;
+  } finally {
+    if (checkingSession === pending2) checkingSession = void 0;
+  }
+  if (generation !== sessionEpoch)
+    throw new PluginError(
+      "conflict",
+      host.t("The Apple Podcasts account changed. Refresh before continuing.")
+    );
   if (current?.id !== next.id) {
-    resources.clear();
+    if (current) {
+      streamEpoch++;
+      pendingStreams.clear();
+    }
     pages.clear();
     staleAt = void 0;
+    regionFiltered = false;
+    nativeProgress = void 0;
   }
   current = next;
+  sessionCheckedAt = Date.now();
   if (required && !next.authorized)
     throw new PluginError("signIn", host.t("Sign in to Apple Podcasts first"));
   return next;
@@ -242,21 +261,24 @@ async function session(required = false) {
 async function get(path, all = false) {
   const result = await rpc("api.get", { path, all });
   if (result.sync?.stale) staleAt = result.sync.at;
+  if (result.sync?.reason === "region") regionFiltered = true;
   return result;
 }
-var syncDescription = () => current?.offline || staleAt ? host.t(
+var syncDescription = () => regionFiltered || current?.routeCountry && current.routeCountry !== current.country ? host.t(
+  "This network redirects Apple Podcasts to another region. Some followed shows may be hidden. Check proxy rules and refresh; missing rows do not mean you unfollowed them."
+) : current?.offline || staleAt ? host.t(
   "Offline: showing the last confirmed snapshot. Changes require confirmation in Playback and Sync."
 ) + (staleAt ? ` (${staleAt})` : "") : void 0;
 var epQuery = "include[podcast-episodes]=podcast,playback-position&extend[podcast-episodes]=inLibrary&platform=web";
 async function library(kind) {
   await session(true);
-  return remember(
+  return resourceList(
     (await get(`/v1/me/library/${kind}?${epQuery}&limit=60`, true)).data
   );
 }
 async function continuing() {
   await session(true);
-  return remember(
+  return resourceList(
     (await get(
       `/v1/me/continue-playing/podcast-episodes?${epQuery}&limit=30`,
       true
@@ -282,7 +304,7 @@ async function episode(id) {
       "unavailable",
       host.t("This episode is not available")
     );
-  remember([item]);
+  resourceList([item]);
   return item;
 }
 async function account() {
@@ -300,7 +322,12 @@ async function signIn() {
   await rpc("auth.start");
   const deadline = Date.now() + 27e4;
   while (Date.now() < deadline) {
-    const a = await account();
+    const s = await session(false, true);
+    const a = s.authorized ? {
+      id: s.id,
+      name: `Apple Podcasts (${s.country.toUpperCase()})`,
+      page: "account"
+    } : null;
     if (a) return a;
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
@@ -310,15 +337,23 @@ async function signIn() {
   );
 }
 async function signOut() {
+  streamEpoch++;
+  sessionEpoch++;
+  sessionCheckedAt = 0;
+  checkingSession = void 0;
+  pendingStreams.clear();
   await rpc("auth.signout");
   current = void 0;
-  resources.clear();
   pages.clear();
 }
 async function setSetting() {
+  streamEpoch++;
+  sessionEpoch++;
+  sessionCheckedAt = 0;
+  checkingSession = void 0;
+  pendingStreams.clear();
   await disconnect();
   current = void 0;
-  resources.clear();
   pages.clear();
 }
 async function shows() {
@@ -358,7 +393,7 @@ async function show({
     const list = detail.relationships?.episodes;
     page = {
       show: detail,
-      episodes: remember(list?.data ?? []),
+      episodes: resourceList(list?.data ?? []),
       next: list?.next
     };
     pages.set(key, page);
@@ -377,14 +412,11 @@ async function show({
       );
     cursors.add(page.next);
     const response = await get(page.next);
-    if (!response.data?.length && response.next)
-      throw new PluginError(
-        "network",
-        host.t("Apple Podcasts returned an incomplete page")
-      );
     const known = new Set(page.episodes.map((item) => item.id));
     page.episodes.push(
-      ...remember((response.data ?? []).filter((item) => !known.has(item.id)))
+      ...resourceList(
+        (response.data ?? []).filter((item) => !known.has(item.id))
+      )
     );
     page.next = response.next;
   }
@@ -418,7 +450,7 @@ async function search({
   });
   const r = await get(`/v1/catalog/${s.country}/search?${params}&${epQuery}`);
   const result = r.results?.[type] ?? { data: r.data, next: r.next };
-  const list = remember(result.data ?? []);
+  const list = resourceList(result.data ?? []);
   return {
     [kind]: kind === "shows" ? list.map((x) => toShow(x, !!x.attributes?.inLibrary)) : list.map(toTrack),
     more: !!result.next
@@ -437,7 +469,8 @@ async function likeEpisode({ id, on }) {
 }
 async function home() {
   staleAt = void 0;
-  const s = await session();
+  regionFiltered = false;
+  const s = await session(false, true);
   if (!s.authorized)
     return {
       title: host.t("Apple Podcasts"),
@@ -449,7 +482,9 @@ async function home() {
   const [tracks, followed] = await Promise.all([continuing(), shows()]);
   return {
     title: host.t("Apple Podcasts"),
-    description: syncDescription(),
+    description: syncDescription() ?? (!host.capabilities?.playbackProgress ? host.t(
+      "This MyGo build cannot report playback progress. Use the companion MyGo build for resume and progress sync."
+    ) : void 0),
     sections: [
       {
         title: host.t("Continue Listening"),
@@ -479,24 +514,14 @@ async function browse({ page }) {
     );
     return {
       title: host.t("Latest Episodes"),
-      sections: [{ tracks: remember(r.data).map(toTrack) }]
+      sections: [{ tracks: resourceList(r.data).map(toTrack) }]
     };
   }
-  if (page === "account")
-    return {
-      title: host.t("Apple Podcasts"),
-      sections: [
-        { title: host.t("Following"), shows: await shows() },
-        {
-          title: host.t("Continue Listening"),
-          tracks: (await continuing()).map(toTrack)
-        }
-      ]
-    };
+  if (page === "account") return home();
   if (page === "sync") {
     const s = await session(true);
     const sync = await rpc("sync.status");
-    const state = await remoteState();
+    const state = nativeProgress?.context === s.id ? { trackId: nativeProgress.id } : void 0;
     const links = state?.trackId ? [
       {
         title: host.t("Mark as Played"),
@@ -509,11 +534,6 @@ async function browse({ page }) {
         icon: "repeat"
       }
     ] : [];
-    links.push({
-      title: host.t("Open Apple Podcasts Window"),
-      page: "window",
-      icon: "link"
-    });
     if (state?.trackId)
       links.unshift({
         title: host.t("Episode Listening Status"),
@@ -521,7 +541,7 @@ async function browse({ page }) {
         icon: "podcast"
       });
     const pending2 = sync.pending.flatMap((op) => {
-      const action = op.kind === "completed" ? op.on ? "Mark as Played" : "Mark as Unplayed" : op.kind === "podcasts" ? op.on ? "Follow" : "Unfollow" : op.on ? "Save Episode" : "Unsave Episode";
+      const action = op.kind === "position" ? "Sync Playback Position" : op.kind === "completed" ? op.on ? "Mark as Played" : "Mark as Unplayed" : op.kind === "podcasts" ? op.on ? "Follow" : "Unfollow" : op.on ? "Save Episode" : "Unsave Episode";
       return [
         {
           title: `${host.t("Retry")}: ${host.t(action)} \xB7 ${op.item}`,
@@ -551,10 +571,6 @@ async function browse({ page }) {
       ]
     };
   }
-  if (page === "window") {
-    await rpc("window.show");
-    return browse({ page: "sync" });
-  }
   const episodePage = /^episode:(\d+)$/.exec(page);
   if (episodePage) {
     const item = await episode(episodePage[1]), track = toTrack(item);
@@ -573,10 +589,6 @@ ${track.description}`,
         { tracks: [track] },
         {
           links: [
-            {
-              title: host.t("Play from Beginning"),
-              page: `beginning:${item.id}`
-            },
             { title: host.t("Mark as Played"), page: `completed:${item.id}:1` },
             {
               title: host.t("Mark as Unplayed"),
@@ -585,16 +597,6 @@ ${track.description}`,
           ]
         }
       ]
-    };
-  }
-  const beginning = /^beginning:(\d+)$/.exec(page);
-  if (beginning) {
-    const item = await episode(beginning[1]);
-    await rpc("player.play", { items: [playerItem(item)], position: 0 });
-    return {
-      title: host.t("Playback and Sync"),
-      description: host.t("Playing from the beginning"),
-      sections: []
     };
   }
   const pendingAction = /^(retry|discard):([a-f0-9]{24})$/.exec(page);
@@ -615,50 +617,38 @@ ${track.description}`,
   }
   throw new PluginError("unsupported", host.t("This page is not available"));
 }
-async function remotePlay({
-  ids,
-  start = 0,
-  position = 0
-}) {
-  const selected = ids.slice(start);
-  if (!selected.length) return;
-  if (selected.length > 200)
-    throw new PluginError(
-      "unsupported",
-      host.t(
-        "This preview supports queues of up to 200 episodes. Select a smaller queue."
-      )
-    );
-  const items = [];
-  for (const id of selected) {
-    numericID(id);
-    items.push(resources.get(id) ?? await episode(id));
+async function stream({ id }) {
+  numericID(id);
+  const generation = streamEpoch, key = `${generation}:${id}`;
+  if (pendingStreams.has(key)) return pendingStreams.get(key);
+  const pending2 = rpc("media.stream", {
+    id
+  }).then((result) => {
+    if (generation !== streamEpoch)
+      throw new PluginError(
+        "conflict",
+        host.t(
+          "The Apple Podcasts account changed. Refresh before continuing."
+        )
+      );
+    return result;
+  });
+  pendingStreams.set(key, pending2);
+  try {
+    return await pending2;
+  } finally {
+    if (pendingStreams.get(key) === pending2) pendingStreams.delete(key);
   }
-  items[0] = await episode(items[0].id);
-  const cloud = items[0].relationships?.["playback-position"]?.data?.[0]?.attributes;
-  const resume = position > 0 ? position : cloud?.completed ? 0 : Number(cloud?.positionInMilliseconds) || 0;
-  await rpc("player.play", { items: items.map(playerItem), position: resume });
 }
-async function remotePause() {
-  await rpc("player.control", { action: "pause" });
+async function playbackStart({ id }) {
+  numericID(id);
+  return rpc("progress.start", { id });
 }
-async function remoteResume() {
-  await rpc("player.control", { action: "resume" });
-}
-async function remoteSeek({ position }) {
-  await rpc("player.control", { action: "seek", value: position });
-}
-async function remoteVolume({ percent }) {
-  await rpc("player.control", { action: "volume", value: percent });
-}
-async function remoteState() {
-  return rpc("player.state");
-}
-async function remoteDevices() {
-  return [{ id: "chrome", name: "Apple Podcasts \xB7 Chrome", active: true }];
-}
-async function remoteUse() {
-  return;
+async function playbackProgress(progress) {
+  if (!progress.context) return;
+  nativeProgress = progress;
+  await rpc("progress.record", progress);
+  if (progress.reason === "quit") await rpc("progress.flush");
 }
 export {
   account,
@@ -667,20 +657,15 @@ export {
   isLiked,
   likeEpisode,
   liked,
+  playbackProgress,
+  playbackStart,
   recent,
-  remoteDevices,
-  remotePause,
-  remotePlay,
-  remoteResume,
-  remoteSeek,
-  remoteState,
-  remoteUse,
-  remoteVolume,
   search,
   setSetting,
   show,
   shows,
   signIn,
   signOut,
+  stream,
   subscribeShow
 };
