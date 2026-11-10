@@ -1,0 +1,30 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+bin/
+*.exe
+*.test
+
+# Local verification and browser data
+.work/
+work/
+.playwright-cli/
+playwright-report/
+test-results/
+profiles/
+browser-profile/
+session-data/
+private-fixtures/
+artifacts/
+*.har
+*.log
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
