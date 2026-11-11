@@ -1,8 +1,10 @@
 # MyGo 原生播放进度补丁
 
-基于官方 MyGo Music 0.1.22，基线提交 `1af0d8efd77fdf630c27cfc635f12e9cb089ce10`；配套构建的源码提交 `b9ae4057d0c465398085ffc9c2410cbfa7ad815a`。
+基于官方 MyGo Music 0.1.22，基线提交 `1af0d8efd77fdf630c27cfc635f12e9cb089ce10`；配套构建的源码提交 `59c76a17aae40fb20e41bd6ac2e25c77c90f553a`。
 
 该构建是本项目的配套版本，不是 MyGo 官方发行版。增加通用、可选的 playbackStart/playbackProgress 接口，用于原生播放器云端续播及真实位置上报；未实现这些导出的插件不增加周期任务。
+
+preview.2 还修复“关注的节目”首次加载后永久保留旧列表的问题。可选 `libraryRefreshSeconds` 启用前台周期更新和重回窗口刷新，未启用的来源不增加轮询。新增行为测试覆盖动态关注/取消、后台不轮询、重回前台、并发合并与旧回包隔离。
 
 完整修改见 [native-playback-progress.patch](native-playback-progress.patch)。对应完整源码为 Releases 中的 `mygo-music-native-progress-source.zip`。宿主及补丁遵循原仓库 [AGPL-3.0](LICENSE)，包含原许可证；其他项目文件的许可不在此另行变更。
 

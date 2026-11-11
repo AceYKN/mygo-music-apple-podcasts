@@ -269,3 +269,44 @@ test('An empty episode page with an advancing cursor does not hide later episode
   assert.equal(result.episodes[0].id, '1001');
   assert.equal(result.more, false);
 });
+
+test('Following always reflects arbitrary cloud additions and removals and rejects filtered snapshots', async () => {
+  let cloud = ['42'],
+    filtered = false,
+    checks = 0;
+  const p = await plugin(async (method, args) => {
+    if (method === 'auth.status') {
+      if (args.refresh) checks++;
+      return { ok: true, data: session };
+    }
+    return {
+      ok: true,
+      data: {
+        data: cloud.map((id) => ({ id, attributes: { name: 'Show ' + id } })),
+        ...(filtered
+          ? { sync: { stale: true, reason: 'region', routeCountry: 'cn' } }
+          : {}),
+      },
+    };
+  });
+  assert.deepEqual(
+    (await p.shows()).map((x) => x.id),
+    ['42'],
+  );
+  cloud = ['42', '777'];
+  assert.deepEqual(
+    (await p.shows()).map((x) => x.id),
+    ['42', '777'],
+  );
+  cloud = ['777'];
+  assert.deepEqual(
+    (await p.shows()).map((x) => x.id),
+    ['777'],
+  );
+  filtered = true;
+  await assert.rejects(
+    () => p.shows(),
+    (e) => e.code === 'network',
+  );
+  assert.equal(checks, 4);
+});

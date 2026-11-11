@@ -357,7 +357,14 @@ async function setSetting() {
   pages.clear();
 }
 async function shows() {
-  return (await library("podcasts")).map((item) => toShow(item, true));
+  await session(true, true);
+  const result = await get(`/v1/me/library/podcasts?${epQuery}&limit=60`, true);
+  if (result.sync?.reason === "region" || result.sync?.stale)
+    throw new PluginError(
+      "network",
+      syncDescription() ?? host.t("Cannot reach Apple Podcasts. Check your network and retry.")
+    );
+  return resourceList(result.data).map((item) => toShow(item, true));
 }
 async function liked({ offset = 0 } = {}) {
   const all = await library("podcast-episodes");
@@ -479,10 +486,16 @@ async function home() {
       ),
       sections: []
     };
-  const [tracks, followed] = await Promise.all([continuing(), shows()]);
+  const [tracks, following] = await Promise.all([
+    continuing(),
+    library("podcasts")
+  ]);
+  const followed = following.map((item) => toShow(item, true));
   return {
     title: host.t("Apple Podcasts"),
-    description: syncDescription() ?? (!host.capabilities?.playbackProgress ? host.t(
+    description: syncDescription() ?? (!host.capabilities?.libraryRefresh ? host.t(
+      "This MyGo build cannot automatically refresh your library. Install the updated companion MyGo build."
+    ) : !host.capabilities?.playbackProgress ? host.t(
       "This MyGo build cannot report playback progress. Use the companion MyGo build for resume and progress sync."
     ) : void 0),
     sections: [

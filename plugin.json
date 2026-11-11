@@ -1,7 +1,8 @@
 {
   "id": "apple-podcasts",
   "name": "Apple Podcasts",
-  "version": "0.2.0-preview.1",
+  "version": "0.2.0-preview.2",
+  "libraryRefreshSeconds": 30,
   "minAppVersion": "0.1.22",
   "main": "index.js",
   "playback": "stream",

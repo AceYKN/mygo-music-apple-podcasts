@@ -8,7 +8,7 @@ interface HostProcess {
   errorOutput(): string;
 }
 declare const host: {
-  capabilities?: { playbackProgress?: number };
+  capabilities?: { playbackProgress?: number; libraryRefresh?: number };
   dir: string;
   dataDir: string;
   platform: string;

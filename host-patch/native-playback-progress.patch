@@ -18,11 +18,337 @@ index 5477c23..350ac12 100644
  		a.settings.Volume = a.volume
  		a.settings.save()
  		a.saveSession()
+diff --git a/internal/app/library_sync_test.go b/internal/app/library_sync_test.go
+new file mode 100644
+index 0000000..3c1562e
+--- /dev/null
++++ b/internal/app/library_sync_test.go
+@@ -0,0 +1,114 @@
++package app
++
++import (
++	"errors"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/music"
++)
++
++// Cloud follows and unfollows update the actual sidebar page without restarting.
++func TestPodcastsPollsCloudMembershipAndRefocuses(t *testing.T) {
++	a := newTestApp()
++	ch := posts(a)
++	fake(a).caps = map[string]bool{"shows": true}
++	a.library.caps = probeCaps(fake(a))
++	fake(a).info.LibraryRefreshSeconds = 30
++	a.started = true
++	a.subscribedOnce, a.subscribedAt = true, time.Now().Add(-time.Minute)
++	a.subscribed = []music.Show{{ID: "old"}}
++	a.shows["old"] = &showData{show: &music.Show{ID: "old", Subscribed: true}}
++	cloud := []music.Show{{ID: "old"}, {ID: "new"}}
++	var calls atomic.Int32
++	fake(a).shows = func() ([]music.Show, error) { calls.Add(1); return cloud, nil }
++	tt := ui.NewTester(a.view, 1200, 800)
++	tt.Frame()
++	if err := tt.Click("Podcasts"); err != nil {
++		t.Fatal(err)
++	}
++	runPost(t, ch)
++	if len(a.subscribed) != 2 || a.subscribed[1].ID != "new" {
++		t.Fatal("cloud follow did not reach sidebar page")
++	}
++	cloud = []music.Show{{ID: "new"}}
++	tt.Advance(31 * time.Second)
++	tt.Frame()
++	runPost(t, ch)
++	if len(a.subscribed) != 1 || a.subscribed[0].ID != "new" || a.shows["old"].show.Subscribed {
++		t.Fatal("cloud unfollow left stale membership")
++	}
++	before := calls.Load()
++	tt.SetWindowActive(false)
++	tt.Advance(31 * time.Second)
++	tt.Frame()
++	if calls.Load() != before {
++		t.Fatal("hidden window kept polling")
++	}
++	cloud = []music.Show{{ID: "other"}}
++	tt.SetWindowActive(true)
++	tt.Frame()
++	runPost(t, ch)
++	if len(a.subscribed) != 1 || a.subscribed[0].ID != "other" {
++		t.Fatal("refocus did not read current account membership")
++	}
++}
++
++// An old in-flight response cannot clear a newer account's load or list.
++func TestSubscribedRejectsForgottenResponseAndCoalesces(t *testing.T) {
++	a := newTestApp()
++	ch := posts(a)
++	entered, release := make(chan struct{}), make(chan struct{})
++	secondEntered, secondRelease := make(chan struct{}), make(chan struct{})
++	var calls atomic.Int32
++	fake(a).shows = func() ([]music.Show, error) {
++		if calls.Add(1) == 1 {
++			close(entered)
++			<-release
++			return []music.Show{{ID: "old-account"}}, nil
++		}
++		close(secondEntered)
++		<-secondRelease
++		return []music.Show{{ID: "current-account"}}, nil
++	}
++	a.loadSubscribed(a.library, true)
++	<-entered
++	a.loadSubscribed(a.library, true)
++	if calls.Load() != 1 {
++		t.Fatal("duplicate in-flight list read")
++	}
++	a.library.forget()
++	a.loadSubscribed(a.library, true)
++	<-secondEntered
++	close(release)
++	runPost(t, ch)
++	if !a.subscribedBusy || len(a.subscribed) != 0 {
++		t.Fatal("old account response changed current state")
++	}
++	close(secondRelease)
++	runPost(t, ch)
++	if len(a.subscribed) != 1 || a.subscribed[0].ID != "current-account" {
++		t.Fatal("new account list was lost")
++	}
++}
++
++// Refresh failures keep the confirmed list and recover on a later successful read.
++func TestSubscribedRefreshFailurePreservesConfirmedMembership(t *testing.T) {
++	a := newTestApp()
++	ch := posts(a)
++	a.subscribed, a.subscribedOnce = []music.Show{{ID: "confirmed"}}, true
++	fake(a).shows = func() ([]music.Show, error) { return nil, errors.New("network filtered") }
++	a.loadSubscribed(a.library, true)
++	runPost(t, ch)
++	if len(a.subscribed) != 1 || a.subscribedErr == "" {
++		t.Fatal("failed refresh erased confirmed data or hid its error")
++	}
++	fake(a).shows = func() ([]music.Show, error) { return []music.Show{}, nil }
++	a.loadSubscribed(a.library, true)
++	runPost(t, ch)
++	if len(a.subscribed) != 0 || a.subscribedErr != "" {
++		t.Fatal("healthy empty cloud list was ignored")
++	}
++}
+diff --git a/internal/app/sources.go b/internal/app/sources.go
+index d4401ef..6560bd7 100644
+--- a/internal/app/sources.go
++++ b/internal/app/sources.go
+@@ -97,10 +97,14 @@ type library struct {
+ 	searches  map[route]*searchData
+ 	searched  route // the search last shown, which the sidebar goes back to
+ 
+-	subscribed     []music.Show
+-	subscribedOnce bool // what the listener subscribes to was asked
+-	subscribedBusy bool
+-	subscribedErr  string
++	subscribed          []music.Show
++	subscribedOnce      bool // what the listener subscribes to was asked
++	subscribedBusy      bool
++	subscribedErr       string
++	subscribedAt        time.Time
++	subscribedRevision  uint64
++	subscribedMutations int
++	libraryPollAt       time.Time
+ 
+ 	stations     []music.Station
+ 	stationsBusy bool
+@@ -133,6 +137,9 @@ func (l *library) forget() {
+ 	l.likedList, l.likedPaged, l.likedAt = nil, paged{}, time.Time{}
+ 	l.savedAlbums, l.savedAlbumsPaged = nil, paged{}
+ 	l.subscribed, l.subscribedOnce = nil, false
++	l.subscribedBusy, l.subscribedAt = false, time.Time{}
++	l.subscribedRevision++
++	l.libraryPollAt = time.Time{}
+ 	l.stations, l.stationsOnce = nil, false
+ }
+ 
+diff --git a/internal/app/ui_main.go b/internal/app/ui_main.go
+index 33aea70..82eafce 100644
+--- a/internal/app/ui_main.go
++++ b/internal/app/ui_main.go
+@@ -27,8 +27,16 @@ func (a *app) view(c *ui.Context) {
+ 	active := c.WindowActive()
+ 	if active && a.wasBehind {
+ 		a.freshen()
++		if a.library != nil {
++			a.library.libraryPollAt = time.Time{}
++		}
+ 	}
+ 	a.wasBehind = !active
++	if active {
++		if delay := a.pollLibrary(c.Now()); delay > 0 {
++			c.After(delay)
++		}
++	}
+ 
+ 	if c.Vibrancy() {
+ 		c.Root().Background(ui.Transparent)
+@@ -159,7 +167,7 @@ func (a *app) load(r route) {
+ 	case pageShow:
+ 		a.loadShow(lib, r.id)
+ 	case pageShows:
+-		a.loadSubscribed(lib)
++		a.loadSubscribed(lib, false)
+ 	case pageStations:
+ 		a.loadStations(lib)
+ 	case pageLiked:
+@@ -567,11 +575,45 @@ func (a *app) freshen() {
+ 	if time.Since(lib.mineAt) > listsFresh {
+ 		a.loadMine(lib)
+ 	}
+-	if r := a.route; r.src == lib.id && (r.page == pagePlaylist || r.page == pageLiked) {
++	if r := a.route; r.src == lib.id && (r.page == pagePlaylist || r.page == pageLiked || r.page == pageShows || r.page == pageBrowse || r.page == pageSection) {
+ 		a.load(r)
+ 	}
+ }
+ 
++// pollLibrary refreshes opted-in sources without keeping hidden windows awake.
++func (a *app) pollLibrary(now time.Time) time.Duration {
++	lib := a.library
++	if lib == nil || !lib.started || lib.src.Info().LibraryRefreshSeconds <= 0 {
++		return 0
++	}
++	interval := time.Duration(min(3600, max(15, lib.src.Info().LibraryRefreshSeconds))) * time.Second
++	if !lib.libraryPollAt.IsZero() && now.Before(lib.libraryPollAt.Add(interval)) {
++		return lib.libraryPollAt.Add(interval).Sub(now)
++	}
++	lib.libraryPollAt = now
++	if lib.can("account") {
++		a.loadAccount(lib)
++	}
++	if !lib.homeLoading && (lib.can("home") || lib.can("recent")) {
++		a.loadHome(lib)
++	}
++	if lib.can("shows") && (lib.subscribedOnce || a.route.page == pageShows) {
++		a.loadSubscribed(lib, true)
++	}
++	if a.route.src == lib.id {
++		switch a.route.page {
++		case pageBrowse, pageSection:
++			a.loadBrowse(lib, a.route.id, true)
++		case pageLiked:
++			if lib.likedPaged.loaded && !lib.likedPaged.loading && !lib.likedFresh {
++				lib.likedAt = time.Time{}
++				a.freshenLiked(lib)
++			}
++		}
++	}
++	return interval
++}
++
+ func firstPlayable(tracks []music.Track) int {
+ 	for i := range tracks {
+ 		if !tracks[i].Unavailable {
+diff --git a/internal/app/ui_podcast.go b/internal/app/ui_podcast.go
+index 0ed26ee..9e46b03 100644
+--- a/internal/app/ui_podcast.go
++++ b/internal/app/ui_podcast.go
+@@ -95,11 +95,20 @@ func (a *app) toggleSubscribe(lib *library, d *showData) {
+ 	show := d.show
+ 	sub := !show.Subscribed
+ 	show.Subscribed, d.subscribing = sub, true
++	lib.subscribedRevision++
++	revision := lib.subscribedRevision
++	lib.subscribedBusy = false
++	lib.subscribedMutations++
+ 	id := show.ID
+ 	go func() {
+ 		err := lib.src.SubscribeShow(id, sub)
+ 		a.post(func() {
+ 			d.subscribing = false
++			lib.subscribedMutations--
++			lib.subscribedAt, lib.libraryPollAt = time.Time{}, time.Time{}
++			if revision != lib.subscribedRevision {
++				return
++			}
+ 			switch {
+ 			case err != nil:
+ 				show.Subscribed = !sub
+@@ -283,21 +292,35 @@ func (a *app) showPane(c *ui.Context, tr *music.Track) {
+ 	})
+ }
+ 
+-// loadSubscribed loads the shows the listener subscribes to, once.
+-func (a *app) loadSubscribed(lib *library) {
+-	if lib.subscribedOnce || lib.subscribedBusy {
++// loadSubscribed keeps the last list while asking for its current membership.
++func (a *app) loadSubscribed(lib *library, again bool) {
++	if lib.subscribedBusy || lib.subscribedMutations > 0 || lib.subscribedOnce && !again && time.Since(lib.subscribedAt) <= listsFresh {
+ 		return
+ 	}
+ 	lib.subscribedBusy, lib.subscribedErr = true, ""
++	lib.subscribedAt = time.Now()
++	revision := lib.subscribedRevision
+ 	go func() {
+ 		shows, err := lib.src.Shows()
+ 		a.post(func() {
++			if revision != lib.subscribedRevision {
++				return
++			}
+ 			lib.subscribedBusy = false
+ 			if err != nil {
+ 				lib.subscribedErr = a.problem(lib, err, T("Couldn't load your podcasts"))
+ 				return
+ 			}
+ 			lib.subscribed, lib.subscribedOnce = shows, true
++			followed := map[string]bool{}
++			for _, show := range shows {
++				followed[show.ID] = true
++			}
++			for id, detail := range lib.shows {
++				if detail.show != nil && !detail.subscribing {
++					detail.show.Subscribed = followed[id]
++				}
++			}
+ 		})
+ 	}()
+ }
+@@ -306,7 +329,7 @@ func (a *app) loadSubscribed(lib *library) {
+ func (a *app) showsPage(c *ui.Context) {
+ 	lib := a.library
+ 	if !lib.subscribedOnce && !lib.subscribedBusy {
+-		a.centered(c, lib.subscribedErr, func() { a.loadSubscribed(lib) })
++		a.centered(c, lib.subscribedErr, func() { a.loadSubscribed(lib, true) })
+ 		return
+ 	}
+ 	top, bottom := a.insets(c)
+@@ -314,6 +337,12 @@ func (a *app) showsPage(c *ui.Context) {
+ 		a.startMark(c)
+ 		defer a.endMark(c)
+ 		a.heading(c, a.builtinTitle("shows"), "")
++		if lib.subscribedErr != "" {
++			ui.Text(c, lib.subscribedErr).FontSize(13).TextColor(a.pal.muted)
++			if ui.Button(c.Key("retry"), T("Retry")).Clicked() {
++				a.loadSubscribed(lib, true)
++			}
++		}
+ 		cols := a.columns(c, 150)
+ 		if !lib.subscribedOnce {
+ 			a.playlistCardsSkeleton(c, a.pageShimmer(c), cols*2, 150, true)
 diff --git a/internal/music/music.go b/internal/music/music.go
-index 9cf71e2..61f544c 100644
+index 9cf71e2..6cae8a2 100644
 --- a/internal/music/music.go
 +++ b/internal/music/music.go
-@@ -388,6 +388,30 @@ type Recorder interface {
+@@ -326,6 +326,9 @@ type Info struct {
+ 	// Navigation is the sidebar while the source is active, in this order. With
+ 	// none, the sidebar has an entry for each of the app's pages the source can do.
+ 	Navigation []NavItem `json:"navigation,omitempty"`
++	// LibraryRefreshSeconds opts in to refreshing account pages while visible.
++	// Zero leaves refresh timing to the app's ordinary page caches.
++	LibraryRefreshSeconds int `json:"libraryRefreshSeconds,omitempty"`
+ }
+ 
+ var (
+@@ -388,6 +391,30 @@ type Recorder interface {
  	Played(track Track)
  }
  
@@ -548,7 +874,7 @@ index 0000000..00e3996
 +	}
 +}
 diff --git a/internal/plugin/host.go b/internal/plugin/host.go
-index be7c8ab..2bc4f33 100644
+index be7c8ab..d6093db 100644
 --- a/internal/plugin/host.go
 +++ b/internal/plugin/host.go
 @@ -86,10 +86,11 @@ func (p *Plugin) installHost(v *vm) error {
@@ -563,7 +889,7 @@ index be7c8ab..2bc4f33 100644
 +		"arch":         runtime.GOARCH,
 +		"dir":          p.dir,
 +		"dataDir":      p.data,
-+		"capabilities": map[string]any{"playbackProgress": 1},
++		"capabilities": map[string]any{"playbackProgress": 1, "libraryRefresh": 1},
  		"storage": map[string]any{
  			"get":    moejs.NativeFunc(p.storageGet(v)),
  			"set":    moejs.NativeFunc(p.storageSet(v)),

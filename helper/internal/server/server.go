@@ -99,7 +99,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dispatch(ctx context.Context, method string, p params) (any, error) {
 	switch method {
 	case "health":
-		return map[string]any{"protocol": 1, "version": "0.2.0-preview.1", "playback": "stream"}, nil
+		return map[string]any{"protocol": 1, "version": "0.2.0-preview.2", "playback": "stream"}, nil
 	case "auth.status":
 		if p.Refresh && s.Apple.HTTP != nil {
 			s.Apple.HTTP.CloseIdleConnections()

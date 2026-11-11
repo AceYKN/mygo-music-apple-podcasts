@@ -5,7 +5,7 @@ import { zipSync } from 'fflate';
 
 // Package the exact companion source used by this preview alongside its binary.
 const source = resolve(process.argv[2] ?? '../mygo-music');
-const commit = 'b9ae4057d0c465398085ffc9c2410cbfa7ad815a';
+const commit = '59c76a17aae40fb20e41bd6ac2e25c77c90f553a';
 const head = execFileSync('git', ['rev-parse', 'HEAD'], {
   cwd: source,
   encoding: 'utf8',
@@ -26,7 +26,7 @@ files['SOURCE.txt'] = new TextEncoder().encode(
     `Source commit: ${commit}\n` +
     `License: AGPL-3.0 (see LICENSE)\n` +
     `Corresponding source: mygo-music-native-progress-source.zip in the same release\n` +
-    `Patch, build instructions and source download:\nhttps://github.com/AceYKN/mygo-music-apple-podcasts/releases/tag/v0.2.0-preview.1\n` +
+    `Patch, build instructions and source download:\nhttps://github.com/AceYKN/mygo-music-apple-podcasts/releases/tag/v0.2.0-preview.2\n` +
     `This is a companion build, not an official MyGo release.\n`,
 );
 files['使用说明.txt'] = new TextEncoder().encode(

@@ -70,5 +70,6 @@
   "The playback belongs to a different account session. Start the episode again.": "此播放属于另一个账号会话，请重新打开单集。",
   "This episode needs a protected or segmented playback format that has not been verified with native MyGo playback": "该单集使用受保护或分段音频，尚未通过 MyGo 原生播放验证。",
   "This network redirects Apple Podcasts to another region. Some followed shows may be hidden. Check proxy rules and refresh; missing rows do not mean you unfollowed them.": "当前网络将苹果播客跳转到了其他地区，部分关注节目可能被隐藏。请检查代理规则后刷新；列表缺项不代表你取消了关注。",
-  "Apple Podcasts is routing this network to another region. Check your proxy rules before confirming account changes.": "当前网络将苹果播客跳转到了其他地区。请检查代理规则后再确认账号同步操作。"
+  "Apple Podcasts is routing this network to another region. Check your proxy rules before confirming account changes.": "当前网络将苹果播客跳转到了其他地区。请检查代理规则后再确认账号同步操作。",
+  "This MyGo build cannot automatically refresh your library. Install the updated companion MyGo build.": "此 MyGo 版本尚不支持资料库自动刷新，请安装新版配套 MyGo。"
 }
